@@ -1,10 +1,19 @@
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
-from sqlalchemy import desc, select
+from collections import Counter, defaultdict
+
+from fastapi import APIRouter, Depends, File, HTTPException, Response, UploadFile, status
+from sqlalchemy import asc, desc, select
 from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.models import Detection, Video
-from app.schemas import StatusOut, VideoOut
+from app.schemas import (
+    DetectionOut,
+    LabelCount,
+    StatusOut,
+    SummaryOut,
+    TimelineBucket,
+    VideoOut,
+)
 from app.services import rekognition, s3_service
 
 router = APIRouter(prefix="/api/videos", tags=["videos"])
@@ -113,3 +122,66 @@ def video_status(video_id: int, db: Session = Depends(get_db)) -> StatusOut:
         job_id=video.job_id,
         rekognition_status=result.status,
     )
+
+
+@router.get("/{video_id}/detections", response_model=list[DetectionOut])
+def list_detections(
+    video_id: int,
+    label: str | None = None,
+    db: Session = Depends(get_db),
+) -> list[Detection]:
+    _get_video_or_404(db, video_id)
+    stmt = select(Detection).where(Detection.video_id == video_id)
+    if label:
+        stmt = stmt.where(Detection.label == label)
+    stmt = stmt.order_by(asc(Detection.timestamp_ms))
+    return list(db.scalars(stmt).all())
+
+
+@router.get("/{video_id}/summary", response_model=SummaryOut)
+def video_summary(video_id: int, db: Session = Depends(get_db)) -> SummaryOut:
+    video = _get_video_or_404(db, video_id)
+    detections = list(
+        db.scalars(
+            select(Detection)
+            .where(Detection.video_id == video_id)
+            .order_by(asc(Detection.timestamp_ms))
+        ).all()
+    )
+
+    label_counter: Counter[str] = Counter()
+    per_second: dict[int, int] = defaultdict(int)
+    for det in detections:
+        label_counter[det.label] += det.count
+        per_second[det.timestamp_ms // 1000] += det.count
+
+    timeline = [
+        TimelineBucket(second=sec, count=cnt) for sec, cnt in sorted(per_second.items())
+    ]
+    busiest = max(per_second.items(), key=lambda kv: kv[1], default=(None, 0))
+
+    return SummaryOut(
+        video_id=video.id,
+        status=video.status,
+        total_vehicles=video.total_vehicles,
+        duration_sec=video.duration_sec,
+        label_distribution=[
+            LabelCount(label=lbl, count=cnt)
+            for lbl, cnt in sorted(label_counter.items(), key=lambda kv: -kv[1])
+        ],
+        busiest_second=busiest[0],
+        busiest_second_count=busiest[1],
+        timeline=timeline,
+    )
+
+
+@router.delete("/{video_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_video(video_id: int, db: Session = Depends(get_db)) -> Response:
+    video = _get_video_or_404(db, video_id)
+    try:
+        s3_service.delete_object(video.s3_key)
+    except RuntimeError:
+        pass  # S3 delete failure should not block DB cleanup
+    db.delete(video)
+    db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
