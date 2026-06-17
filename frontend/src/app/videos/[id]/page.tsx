@@ -63,7 +63,7 @@ export default function VideoDetailPage() {
 
   const availableLabels = useMemo(() => {
     if (!summary) return VEHICLE_LABELS;
-    const fromData = summary.label_distribution.map((l) => l.label);
+    const fromData = summary.object_distribution.map((l) => l.object_type);
     return Array.from(new Set([...VEHICLE_LABELS, ...fromData]));
   }, [summary]);
 
@@ -135,9 +135,9 @@ export default function VideoDetailPage() {
                     <table className="w-full text-sm">
                       <thead className="sticky top-0 bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500">
                         <tr>
-                          <th className="px-4 py-2">Zaman</th>
+                          <th className="px-4 py-2">Baslangic</th>
+                          <th className="px-4 py-2">Bitis</th>
                           <th className="px-4 py-2">Tur</th>
-                          <th className="px-4 py-2 text-right">Adet</th>
                           <th className="px-4 py-2 text-right">Guven</th>
                         </tr>
                       </thead>
@@ -148,14 +148,16 @@ export default function VideoDetailPage() {
                             className="border-t border-slate-100 hover:bg-slate-50"
                           >
                             <td className="px-4 py-2 font-mono text-slate-700">
-                              {msToClock(d.timestamp_ms)}
+                              {msToClock(d.timestamp_start_ms)}
                             </td>
-                            <td className="px-4 py-2 text-slate-900">{d.label}</td>
-                            <td className="px-4 py-2 text-right text-slate-700">
-                              {d.count}
+                            <td className="px-4 py-2 font-mono text-slate-700">
+                              {msToClock(d.timestamp_end_ms)}
+                            </td>
+                            <td className="px-4 py-2 text-slate-900">
+                              {d.object_type}
                             </td>
                             <td className="px-4 py-2 text-right text-slate-700">
-                              {d.confidence.toFixed(1)}
+                              {(d.confidence * 100).toFixed(1)}
                             </td>
                           </tr>
                         ))}
