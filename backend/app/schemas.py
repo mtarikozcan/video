@@ -8,9 +8,9 @@ class VideoOut(BaseModel):
 
     id: int
     filename: str
-    s3_key: str
+    gcs_object: str
     status: str
-    job_id: str | None = None
+    operation_name: str | None = None
     duration_sec: float | None = None
     total_vehicles: int = 0
     created_at: datetime
@@ -21,14 +21,14 @@ class DetectionOut(BaseModel):
 
     id: int
     video_id: int
-    label: str
-    timestamp_ms: int
+    object_type: str
     confidence: float
-    count: int
+    timestamp_start_ms: int
+    timestamp_end_ms: int
 
 
-class LabelCount(BaseModel):
-    label: str
+class ObjectCount(BaseModel):
+    object_type: str
     count: int
 
 
@@ -42,7 +42,7 @@ class SummaryOut(BaseModel):
     status: str
     total_vehicles: int
     duration_sec: float | None = None
-    label_distribution: list[LabelCount] = Field(default_factory=list)
+    object_distribution: list[ObjectCount] = Field(default_factory=list)
     busiest_second: int | None = None
     busiest_second_count: int = 0
     timeline: list[TimelineBucket] = Field(default_factory=list)
@@ -51,5 +51,5 @@ class SummaryOut(BaseModel):
 class StatusOut(BaseModel):
     video_id: int
     status: str
-    job_id: str | None = None
-    rekognition_status: str | None = None
+    operation_name: str | None = None
+    operation_done: bool | None = None
