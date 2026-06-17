@@ -31,15 +31,15 @@ export function SummaryCards({ summary }: { summary: Summary }) {
             Tur dagilimi
           </p>
           <ul className="mt-2 space-y-1">
-            {summary.label_distribution.length === 0 ? (
+            {summary.object_distribution.length === 0 ? (
               <li className="text-sm text-slate-500">Tespit yok</li>
             ) : (
-              summary.label_distribution.map((l) => (
+              summary.object_distribution.map((l) => (
                 <li
-                  key={l.label}
+                  key={l.object_type}
                   className="flex items-center justify-between text-sm"
                 >
-                  <span className="text-slate-700">{l.label}</span>
+                  <span className="text-slate-700">{l.object_type}</span>
                   <span className="font-semibold text-slate-900">{l.count}</span>
                 </li>
               ))

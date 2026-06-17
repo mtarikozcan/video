@@ -8,17 +8,29 @@ from app.database import get_db
 from app.models import Detection, Video
 from app.schemas import (
     DetectionOut,
-    LabelCount,
+    ObjectCount,
     StatusOut,
     SummaryOut,
     TimelineBucket,
     VideoOut,
 )
-from app.services import rekognition, s3_service
+from app.services import gcs_service, video_intelligence
 
 router = APIRouter(prefix="/api/videos", tags=["videos"])
 
-ALLOWED_CONTENT_TYPES = {"video/mp4", "video/quicktime", "video/x-matroska", "application/octet-stream"}
+ALLOWED_CONTENT_TYPES = {
+    "video/mp4",
+    "video/quicktime",
+    "video/x-matroska",
+    "application/octet-stream",
+}
+
+
+def _get_video_or_404(db: Session, video_id: int) -> Video:
+    video = db.get(Video, video_id)
+    if not video:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Video not found")
+    return video
 
 
 @router.post("/upload", response_model=VideoOut, status_code=status.HTTP_201_CREATED)
@@ -29,16 +41,15 @@ def upload_video(file: UploadFile = File(...), db: Session = Depends(get_db)) ->
             detail=f"Unsupported content type: {file.content_type}",
         )
 
-    s3_key = s3_service.build_s3_key(file.filename or "video.mp4")
-
+    object_name = gcs_service.build_object_name(file.filename or "video.mp4")
     try:
-        s3_service.upload_fileobj(file.file, s3_key, content_type=file.content_type)
+        gcs_service.upload_fileobj(file.file, object_name, content_type=file.content_type)
     except RuntimeError as exc:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
 
     video = Video(
         filename=file.filename or "video.mp4",
-        s3_key=s3_key,
+        gcs_object=object_name,
         status="uploaded",
     )
     db.add(video)
@@ -52,13 +63,6 @@ def list_videos(db: Session = Depends(get_db)) -> list[Video]:
     return list(db.scalars(select(Video).order_by(desc(Video.created_at))).all())
 
 
-def _get_video_or_404(db: Session, video_id: int) -> Video:
-    video = db.get(Video, video_id)
-    if not video:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Video not found")
-    return video
-
-
 @router.post("/{video_id}/analyze", response_model=VideoOut)
 def analyze_video(video_id: int, db: Session = Depends(get_db)) -> Video:
     video = _get_video_or_404(db, video_id)
@@ -66,13 +70,15 @@ def analyze_video(video_id: int, db: Session = Depends(get_db)) -> Video:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Analysis already running")
 
     try:
-        job_id = rekognition.start_label_detection(video.s3_key)
+        operation_name = video_intelligence.start_object_tracking(
+            gcs_service.gs_uri(video.gcs_object)
+        )
     except RuntimeError as exc:
         video.status = "failed"
         db.commit()
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
 
-    video.job_id = job_id
+    video.operation_name = operation_name
     video.status = "processing"
     db.commit()
     db.refresh(video)
@@ -83,58 +89,60 @@ def analyze_video(video_id: int, db: Session = Depends(get_db)) -> Video:
 def video_status(video_id: int, db: Session = Depends(get_db)) -> StatusOut:
     video = _get_video_or_404(db, video_id)
 
-    if not video.job_id or video.status in {"uploaded", "done", "failed"}:
-        return StatusOut(video_id=video.id, status=video.status, job_id=video.job_id)
+    if not video.operation_name or video.status in {"uploaded", "done", "failed"}:
+        return StatusOut(
+            video_id=video.id,
+            status=video.status,
+            operation_name=video.operation_name,
+        )
 
     try:
-        result = rekognition.fetch_label_detection(video.job_id)
+        result = video_intelligence.fetch_object_tracking(video.operation_name)
     except RuntimeError as exc:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
 
-    if result.status == "SUCCEEDED":
+    if result.done and result.error:
+        video.status = "failed"
+        db.commit()
+        db.refresh(video)
+    elif result.done:
         db.query(Detection).filter(Detection.video_id == video.id).delete()
-        total = 0
-        for det in result.detections:
+        for obj in result.objects:
             db.add(
                 Detection(
                     video_id=video.id,
-                    label=det.label,
-                    timestamp_ms=det.timestamp_ms,
-                    confidence=det.confidence,
-                    count=det.count,
+                    object_type=obj.object_type,
+                    confidence=obj.confidence,
+                    timestamp_start_ms=obj.timestamp_start_ms,
+                    timestamp_end_ms=obj.timestamp_end_ms,
                 )
             )
-            total += det.count
-        video.total_vehicles = total
+        video.total_vehicles = len(result.objects)
         if result.duration_ms is not None:
             video.duration_sec = round(result.duration_ms / 1000.0, 3)
         video.status = "done"
-        db.commit()
-        db.refresh(video)
-    elif result.status == "FAILED":
-        video.status = "failed"
         db.commit()
         db.refresh(video)
 
     return StatusOut(
         video_id=video.id,
         status=video.status,
-        job_id=video.job_id,
-        rekognition_status=result.status,
+        operation_name=video.operation_name,
+        operation_done=result.done,
     )
 
 
 @router.get("/{video_id}/detections", response_model=list[DetectionOut])
 def list_detections(
     video_id: int,
-    label: str | None = None,
+    object_type: str | None = None,
     db: Session = Depends(get_db),
 ) -> list[Detection]:
     _get_video_or_404(db, video_id)
     stmt = select(Detection).where(Detection.video_id == video_id)
-    if label:
-        stmt = stmt.where(Detection.label == label)
-    stmt = stmt.order_by(asc(Detection.timestamp_ms))
+    if object_type:
+        stmt = stmt.where(Detection.object_type == object_type)
+    stmt = stmt.order_by(asc(Detection.timestamp_start_ms))
     return list(db.scalars(stmt).all())
 
 
@@ -145,15 +153,18 @@ def video_summary(video_id: int, db: Session = Depends(get_db)) -> SummaryOut:
         db.scalars(
             select(Detection)
             .where(Detection.video_id == video_id)
-            .order_by(asc(Detection.timestamp_ms))
+            .order_by(asc(Detection.timestamp_start_ms))
         ).all()
     )
 
-    label_counter: Counter[str] = Counter()
+    object_counter: Counter[str] = Counter()
     per_second: dict[int, int] = defaultdict(int)
     for det in detections:
-        label_counter[det.label] += det.count
-        per_second[det.timestamp_ms // 1000] += det.count
+        object_counter[det.object_type] += 1
+        start_sec = det.timestamp_start_ms // 1000
+        end_sec = max(start_sec, det.timestamp_end_ms // 1000)
+        for sec in range(start_sec, end_sec + 1):
+            per_second[sec] += 1
 
     timeline = [
         TimelineBucket(second=sec, count=cnt) for sec, cnt in sorted(per_second.items())
@@ -165,9 +176,9 @@ def video_summary(video_id: int, db: Session = Depends(get_db)) -> SummaryOut:
         status=video.status,
         total_vehicles=video.total_vehicles,
         duration_sec=video.duration_sec,
-        label_distribution=[
-            LabelCount(label=lbl, count=cnt)
-            for lbl, cnt in sorted(label_counter.items(), key=lambda kv: -kv[1])
+        object_distribution=[
+            ObjectCount(object_type=lbl, count=cnt)
+            for lbl, cnt in sorted(object_counter.items(), key=lambda kv: -kv[1])
         ],
         busiest_second=busiest[0],
         busiest_second_count=busiest[1],
@@ -179,9 +190,9 @@ def video_summary(video_id: int, db: Session = Depends(get_db)) -> SummaryOut:
 def delete_video(video_id: int, db: Session = Depends(get_db)) -> Response:
     video = _get_video_or_404(db, video_id)
     try:
-        s3_service.delete_object(video.s3_key)
+        gcs_service.delete_object(video.gcs_object)
     except RuntimeError:
-        pass  # S3 delete failure should not block DB cleanup
+        pass
     db.delete(video)
     db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
