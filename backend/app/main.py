@@ -14,8 +14,14 @@ from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 
 from app.config import settings  # noqa: E402
 from app.database import init_db  # noqa: E402
+from app import models  # noqa: E402,F401 -- register tables on Base.metadata
 from app.routers import videos as videos_router  # noqa: E402
 
+# Configure root logging so messages reach Cloud Run's log capture (stderr).
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
 logger = logging.getLogger("ucuncugoz")
 
 
@@ -28,10 +34,15 @@ async def lifespan(app: FastAPI):
         os.environ.setdefault(
             "GOOGLE_APPLICATION_CREDENTIALS", settings.google_application_credentials
         )
+
+    # Ensure DB schema exists. We do not want a transient connection error
+    # during startup to take the whole revision down — log it loudly instead
+    # and let /health stay green so Cloud Run can route traffic. The next
+    # request that needs tables will surface the underlying problem.
     try:
         init_db()
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("init_db skipped: %s", exc)
+    except Exception:
+        logger.exception("init_db failed — application tables may be missing")
     yield
 
 
